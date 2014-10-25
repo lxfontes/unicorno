@@ -2,17 +2,17 @@ package main
 
 import (
 	"bufio"
+	"flag"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
 	"code.google.com/p/gopacket"
 	"code.google.com/p/gopacket/layers"
 	"code.google.com/p/gopacket/pcap"
 	"code.google.com/p/gopacket/tcpassembly"
 	"code.google.com/p/gopacket/tcpassembly/tcpreader"
-	"flag"
-	"fmt"
-	"log"
-	"net/http"
-	"sync"
-	"time"
 )
 
 var iface = flag.String("i", "en0", "Interface to get packets from")
@@ -55,12 +55,39 @@ func (h *httpStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream
 	return &hstream.r
 }
 
+func (factory *httpStreamFactory) Draw() {
+	factory.mtx.Lock()
+	defer factory.mtx.Unlock()
+	fmt.Printf("\033[2J\033[1;1H")
+	for _, req := range factory.requests {
+		state := "open"
+		delta := (time.Now().Sub(req.startTime)).String()
+		if req.endTime.Unix() > 0 {
+			state = "done"
+			delta = (req.endTime.Sub(req.startTime)).String()
+		}
+
+		fmt.Printf("%s (%s): [%s] %s%s\n", state, delta, req.r.Method, req.r.Host, req.r.RequestURI)
+	}
+
+	for key, req := range factory.requests {
+		if req.endTime.Unix() > 0 && req.endTime.Add(10*time.Second).Before(time.Now()) {
+			delete(factory.requests, key)
+		}
+	}
+}
+func (factory *httpStreamFactory) DrawLoop() {
+	for {
+		factory.Draw()
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func (factory *httpStreamFactory) tagStart(h *httpStream, req *http.Request) {
 	factory.mtx.Lock()
 	defer factory.mtx.Unlock()
 	key := fmt.Sprintf("%s%s", h.net, h.transport)
 	factory.requests[key] = NewHttpReq(req)
-	log.Println("Starting request", req.Host, req.RequestURI)
 }
 
 func (factory *httpStreamFactory) tagStop(h *httpStream, bodyBytes int) {
@@ -71,8 +98,7 @@ func (factory *httpStreamFactory) tagStop(h *httpStream, bodyBytes int) {
 	if !ok {
 		return
 	}
-	log.Println("Finished request", req.r.Host, req.r.RequestURI)
-	delete(factory.requests, key)
+	req.endTime = time.Now()
 }
 
 func (h *httpStream) run() {
@@ -83,7 +109,7 @@ func (h *httpStream) run() {
 			return
 		}
 		h.factory.tagStart(h, req)
-		bodyBytes := tcpreader.DiscardBytesToEOF(req.Body)
+		bodyBytes, err := tcpreader.DiscardBytesToFirstError(buf)
 		req.Body.Close()
 		h.factory.tagStop(h, bodyBytes)
 	}
@@ -91,7 +117,6 @@ func (h *httpStream) run() {
 
 func main() {
 	flag.Parse()
-	log.Printf("starting capture on interface %q", *iface)
 	// Set up pcap packet capture
 	handle, err := pcap.OpenLive(*iface, int32(*snaplen), true, pcap.BlockForever)
 	if err != nil {
@@ -105,6 +130,9 @@ func main() {
 	streamFactory := &httpStreamFactory{
 		requests: make(map[string]*HttpReq),
 	}
+
+	go streamFactory.DrawLoop()
+
 	streamPool := tcpassembly.NewStreamPool(streamFactory)
 	assembler := tcpassembly.NewAssembler(streamPool)
 
@@ -122,7 +150,7 @@ func main() {
 			assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, packet.Metadata().Timestamp)
 
 		case <-ticker:
-			assembler.FlushOlderThan(time.Now().Add(time.Minute * -2))
+			assembler.FlushOlderThan(time.Now().Add(-2 * time.Minute))
 		}
 	}
 }
