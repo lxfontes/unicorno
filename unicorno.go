@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -15,130 +17,139 @@ import (
 	"code.google.com/p/gopacket/tcpassembly/tcpreader"
 )
 
-var iface = flag.String("i", "en0", "Interface to get packets from")
-var snaplen = flag.Int("s", 1600, "SnapLen for pcap packet capture")
-var filter = flag.String("f", "tcp and dst port 80", "BPF filter for pcap")
+var iface = flag.String("i", "eth0", "Interface to get packets from")
+var snaplen = flag.Int("l", 1600, "SnapLen for pcap packet capture")
+var srcFilter = flag.String("s", "tcp and src port 80", "BPF filter for pcap")
+var dstFilter = flag.String("d", "tcp and dst port 80", "BPF filter for pcap")
 
-type httpStreamFactory struct {
-	requests map[string]*HttpReq
+type inFlightRequest struct {
+	req       *http.Request
+	startTime time.Time
+}
+
+func (i *inFlightRequest) String() string {
+	return fmt.Sprintf("[%s] http://%s%s", i.req.Method, i.req.Host, i.req.RequestURI)
+}
+
+type requestPool struct {
+	inFlight map[uint64]*inFlightRequest
 	mtx      sync.Mutex
 }
 
-type HttpReq struct {
-	r         *http.Request
-	startTime time.Time
-	endTime   time.Time
-}
+func (p *requestPool) RemoveInFlight() {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
 
-func NewHttpReq(req *http.Request) *HttpReq {
-	return &HttpReq{
-		r:         req,
-		startTime: time.Now(),
-	}
-}
+	removeQueue := []uint64{}
 
-// httpStream will handle the actual decoding of http requests.
-type httpStream struct {
-	net, transport gopacket.Flow
-	r              tcpreader.ReaderStream
-	factory        *httpStreamFactory
-}
-
-func (h *httpStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
-	hstream := &httpStream{
-		net:       net,
-		transport: transport,
-		r:         tcpreader.NewReaderStream(),
-		factory:   h,
-	}
-	go hstream.run()
-	return &hstream.r
-}
-
-func (factory *httpStreamFactory) Draw() {
-	factory.mtx.Lock()
-	defer factory.mtx.Unlock()
-	fmt.Printf("\033[2J\033[1;1H")
-	for _, req := range factory.requests {
-		state := "open"
-		delta := (time.Now().Sub(req.startTime)).String()
-		if req.endTime.Unix() > 0 {
-			state = "done"
-			delta = (req.endTime.Sub(req.startTime)).String()
-		}
-
-		fmt.Printf("%s (%s): [%s] %s%s\n", state, delta, req.r.Method, req.r.Host, req.r.RequestURI)
-	}
-
-	for key, req := range factory.requests {
-		if req.endTime.Unix() > 0 && req.endTime.Add(10*time.Second).Before(time.Now()) {
-			delete(factory.requests, key)
+	cutOff := time.Now().Add(-1 * time.Minute)
+	for hash, req := range p.inFlight {
+		if req.startTime.Before(cutOff) {
+			removeQueue = append(removeQueue, hash)
 		}
 	}
-}
-func (factory *httpStreamFactory) DrawLoop() {
-	for {
-		factory.Draw()
-		time.Sleep(1 * time.Second)
+
+	for _, hash := range removeQueue {
+		delete(p.inFlight, hash)
 	}
 }
 
-func (factory *httpStreamFactory) tagStart(h *httpStream, req *http.Request) {
-	factory.mtx.Lock()
-	defer factory.mtx.Unlock()
-	key := fmt.Sprintf("%s%s", h.net, h.transport)
-	factory.requests[key] = NewHttpReq(req)
+func (p *requestPool) PutReq(flow gopacket.Flow, req *http.Request, when time.Time) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	r := &inFlightRequest{
+		req:       req,
+		startTime: when,
+	}
+	p.inFlight[flow.FastHash()] = r
 }
 
-func (factory *httpStreamFactory) tagStop(h *httpStream, bodyBytes int) {
-	factory.mtx.Lock()
-	defer factory.mtx.Unlock()
-	key := fmt.Sprintf("%s%s", h.net, h.transport)
-	req, ok := factory.requests[key]
+func (p *requestPool) PutResp(flow gopacket.Flow, resp *http.Response, when time.Time) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	req, ok := p.inFlight[flow.FastHash()]
 	if !ok {
 		return
 	}
-	req.endTime = time.Now()
+
+	deltaTime := when.Sub(req.startTime).String()
+	fmt.Println(req, "->", resp.Status, ":", deltaTime)
+	delete(p.inFlight, flow.FastHash())
 }
 
-func (h *httpStream) run() {
-	buf := bufio.NewReader(&h.r)
-	for {
-		req, err := http.ReadRequest(buf)
-		if err != nil {
-			return
-		}
-		h.factory.tagStart(h, req)
-		bodyBytes, err := tcpreader.DiscardBytesToFirstError(buf)
-		req.Body.Close()
-		h.factory.tagStop(h, bodyBytes)
+type srcStreamFactory struct {
+	pool *requestPool
+}
+
+func (s *srcStreamFactory) New(net gopacket.Flow, transport gopacket.Flow) tcpassembly.Stream {
+	hstream := &tcpStream{
+		net:       net,
+		transport: transport,
+		r:         tcpreader.NewReaderStream(),
 	}
+	go s.run(hstream)
+	return &hstream.r
 }
 
-func main() {
-	flag.Parse()
-	// Set up pcap packet capture
-	handle, err := pcap.OpenLive(*iface, int32(*snaplen), true, pcap.BlockForever)
+type dstStreamFactory struct {
+	pool *requestPool
+}
+
+func (d *dstStreamFactory) New(net gopacket.Flow, transport gopacket.Flow) tcpassembly.Stream {
+	hstream := &tcpStream{
+		net:       net,
+		transport: transport,
+		r:         tcpreader.NewReaderStream(),
+	}
+	go d.run(hstream)
+	return &hstream.r
+}
+
+type tcpStream struct {
+	net       gopacket.Flow
+	transport gopacket.Flow
+	r         tcpreader.ReaderStream
+}
+
+func (d *dstStreamFactory) run(h *tcpStream) {
+	startTime := time.Now()
+	buf := bufio.NewReader(&h.r)
+	req, err := http.ReadRequest(buf)
+	if err != nil {
+		return
+	}
+	defer req.Body.Close()
+	d.pool.PutReq(h.net, req, startTime)
+	tcpreader.DiscardBytesToFirstError(buf)
+}
+
+func (s *srcStreamFactory) run(h *tcpStream) {
+	buf := bufio.NewReader(&h.r)
+	req := &http.Request{}
+	resp, err := http.ReadResponse(buf, req)
+	if err != nil {
+		return
+	}
+	tcpreader.DiscardBytesToFirstError(buf)
+	s.pool.PutResp(h.net, resp, time.Now())
+}
+
+func runFilter(factory tcpassembly.StreamFactory, iface string, snaplen int32, filter string, ch chan os.Signal) {
+	handle, err := pcap.OpenLive(iface, snaplen, true, pcap.BlockForever)
 	if err != nil {
 		panic(err)
 	}
-	if err := handle.SetBPFFilter(*filter); err != nil {
+
+	if err := handle.SetBPFFilter(filter); err != nil {
 		panic(err)
 	}
 
-	// Set up assembly
-	streamFactory := &httpStreamFactory{
-		requests: make(map[string]*HttpReq),
-	}
-
-	go streamFactory.DrawLoop()
-
-	streamPool := tcpassembly.NewStreamPool(streamFactory)
+	streamPool := tcpassembly.NewStreamPool(factory)
 	assembler := tcpassembly.NewAssembler(streamPool)
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packets := packetSource.Packets()
-	// Every minute, flush connections that haven't seen activity in the past 2 minutes.
+
 	ticker := time.Tick(time.Minute)
 	for {
 		select {
@@ -151,6 +162,39 @@ func main() {
 
 		case <-ticker:
 			assembler.FlushOlderThan(time.Now().Add(-2 * time.Minute))
+		case <-ch:
+			return
+		}
+	}
+}
+
+func main() {
+	flag.Parse()
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, os.Kill)
+
+	reqPool := &requestPool{
+		inFlight: make(map[uint64]*inFlightRequest),
+	}
+
+	srcFactory := &srcStreamFactory{pool: reqPool}
+	srcCh := make(chan os.Signal)
+	go runFilter(srcFactory, *iface, int32(*snaplen), *srcFilter, srcCh)
+
+	dstFactory := &dstStreamFactory{pool: reqPool}
+	dstCh := make(chan os.Signal)
+	go runFilter(dstFactory, *iface, int32(*snaplen), *dstFilter, dstCh)
+
+	ticker := time.Tick(time.Second)
+	for {
+		select {
+		case <-ticker:
+			reqPool.RemoveInFlight()
+		case sig := <-ch:
+			srcCh <- sig
+			dstCh <- sig
+			return
 		}
 	}
 }
